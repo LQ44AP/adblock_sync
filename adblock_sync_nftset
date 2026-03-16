@@ -156,7 +156,7 @@ update_list() {
         download_arg="$TMP_DIR/raw_domains.txt"
         download_prog="curl"
     elif command -v wget >/dev/null; then
-        download_cmd="wget --no-check-certificate -4 --timeout=120 --tries=1 -q -O"
+        download_cmd="wget --no-check-certificate -4 --timeout=120 -q -O"
         download_arg="$TMP_DIR/raw_domains.txt"
         download_prog="wget"
     else
