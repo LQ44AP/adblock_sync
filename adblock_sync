@@ -1,0 +1,208 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=15
+
+# --- 配置区 ---
+URL="https://anti-ad.net/domains.txt"
+MEM_DIR="/tmp/dnsmasq_ads"
+MEM_CONF="$MEM_DIR/ad_processed.conf"
+CUSTOM_CONF_DIR="/root/.dnsmasq_custom"
+BACKUP_DIR="$MEM_DIR/backups"
+MAX_BACKUPS=1
+LOCKFILE="/var/run/adblock_sync.lock"
+
+# --- 基础函数 ---
+log() {
+    logger -t AdBlock "$1"
+}
+
+fail() {
+    log "错误：$1"
+    exit 1
+}
+
+# --- 子功能函数 ---
+
+# 检测网络连通性
+network_check() {
+    local count=0
+    local targets="223.5.5.5 www.baidu.com"
+    log "正在检测网络连接..."
+    while true; do
+        for target in $targets; do
+            if ping -c 1 -W 2 $target >/dev/null 2>&1; then
+                log "网络已就绪。"
+                return 0
+            fi
+        done
+        count=$((count + 1))
+        if [ $count -gt 30 ]; then
+            log "网络连接失败，停止本次更新。"
+            exit 0  # 不视为错误，直接退出
+        fi
+        sleep 2
+    done
+}
+
+# 时间同步
+sync_time() {
+    local ntp_server="ntp.aliyun.com"
+    if command -v ntpd >/dev/null; then
+        log "正在同步时间 (ntpd -q)..."
+        ntpd -q -p "$ntp_server" 2>&1 | logger -t AdBlock
+    else
+        log "警告：未找到时间同步工具，跳过时间同步"
+        return 1
+    fi
+}
+
+# 获取互斥锁
+acquire_lock() {
+    if ! mkdir "$LOCKFILE" 2>/dev/null; then
+        log "另一个更新实例正在运行，退出。"
+        exit 1
+    fi
+}
+
+# 释放互斥锁
+release_lock() {
+    rmdir "$LOCKFILE" 2>/dev/null || true
+}
+
+# 准备内存目录及自定义配置
+prepare_directories() {
+    mkdir -p "$MEM_DIR"
+    mkdir -p "$BACKUP_DIR"
+    if [ -d "$CUSTOM_CONF_DIR" ]; then
+        cp "$CUSTOM_CONF_DIR"/*.conf "$MEM_DIR/" 2>/dev/null
+        log "已同步本地自定义配置至内存。"
+    fi
+}
+
+# 确保 dnsmasq 的 confdir 包含 MEM_DIR
+ensure_confdir() {
+    if ! uci -q get dhcp.@dnsmasq[0].confdir | grep -Fx "$MEM_DIR" >/dev/null; then
+        uci add_list dhcp.@dnsmasq[0].confdir="$MEM_DIR"
+        uci commit dhcp
+        log "已成功将 $MEM_DIR 写入 dnsmasq 配置。"
+    fi
+}
+
+# 下载广告列表并转换为 dnsmasq 格式，结果保存在 $TMP_DIR/ad_processed.conf.tmp
+download_and_process() {
+    local download_cmd
+    if command -v curl >/dev/null 2>&1; then
+        download_cmd="curl -4 --connect-timeout 10 --max-time 120 -sL"
+    elif command -v wget >/dev/null 2>&1; then
+        download_cmd="wget --no-check-certificate -4 -q --timeout=120 -O -"
+    else
+        fail "未找到 curl 或 wget，无法下载"
+    fi
+
+    log "开始下载广告域名列表..."
+    if ! $download_cmd "$URL" | awk '{
+        gsub(/\r/,"");
+        if ($1 !~ /^#/ && $1 != "") {
+            printf "address=/%s/0.0.0.0\n", $1
+            printf "address=/%s/::\n", $1
+        }
+    }' | sort -u > "$TMP_DIR/ad_processed.conf.tmp"; then
+        fail "下载失败，请检查网络或URL"
+    fi
+
+    if [ ! -s "$TMP_DIR/ad_processed.conf.tmp" ]; then
+        fail "下载内容为空"
+    fi
+
+    # 语法校验
+    dnsmasq --test --conf-file="$TMP_DIR/ad_processed.conf.tmp" || fail "语法校验失败"
+}
+
+# 备份当前配置文件（如果存在）
+backup_existing() {
+    if [ -f "$MEM_CONF" ]; then
+        BACKUP_NAME="$BACKUP_DIR/ad_$(date +%Y%m%d-%H%M%S).conf"
+        cp -p "$MEM_CONF" "$BACKUP_NAME" || fail "备份失败"
+        ls -t "$BACKUP_DIR"/ad_*.conf 2>/dev/null | tail -n +$((MAX_BACKUPS+1)) | xargs rm -f
+        log "已备份当前配置至 $BACKUP_NAME"
+    else
+        BACKUP_NAME=""
+    fi
+}
+
+# 应用新配置，重启 dnsmasq 并验证，失败则回滚
+apply_new_config() {
+    mv -f "$TMP_DIR/ad_processed.conf.tmp" "$MEM_CONF" || fail "替换文件失败"
+    lines=$(wc -l < "$MEM_CONF")
+    log "生成 $lines 条规则，正在重启 dnsmasq..."
+
+    if ! /etc/init.d/dnsmasq restart >/dev/null 2>&1; then
+        # 重启失败，尝试回滚
+        log "dnsmasq 重启失败，尝试回滚"
+        if [ -n "$BACKUP_NAME" ] && [ -f "$BACKUP_NAME" ]; then
+            cp -f "$BACKUP_NAME" "$MEM_CONF"
+            /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        fi
+        fail "dnsmasq 重启失败，已回滚"
+    fi
+
+    sleep 4
+    local try=0
+    local max_tries=6
+    local success=0
+    while [ $try -lt $max_tries ]; do
+        if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
+            success=1
+            break
+        fi
+        try=$((try+1))
+        [ $try -lt $max_tries ] && sleep 2
+    done
+
+    if [ $success -eq 1 ]; then
+        log "更新完成，拦截已生效"
+    else
+        log "警告：dnsmasq 启动后无法正常解析域名，执行回滚"
+        if [ -n "$BACKUP_NAME" ] && [ -f "$BACKUP_NAME" ]; then
+            cp -f "$BACKUP_NAME" "$MEM_CONF"
+            /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        fi
+        fail "回滚完成，请检查原因"
+    fi
+}
+
+# --- 主流程函数 --
+update_list() {
+    network_check
+    sync_time
+    acquire_lock
+
+    TMP_DIR=$(mktemp -d) || fail "无法创建临时目录"
+    trap "rm -rf '$TMP_DIR' 2>/dev/null; release_lock" EXIT INT TERM
+
+    prepare_directories
+    ensure_confdir
+    download_and_process
+    backup_existing
+    apply_new_config
+
+    release_lock
+    rm -rf "$TMP_DIR"
+}
+
+start() {
+    update_list
+}
+
+reload() {
+    update_list
+}
+
+stop() {
+    :
+}
+
+restart() {
+    reload
+}
