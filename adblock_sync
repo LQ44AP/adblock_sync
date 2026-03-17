@@ -47,10 +47,20 @@ network_check() {
 
 # 时间同步
 sync_time() {
-    local ntp_server="ntp.aliyun.com"
     if command -v ntpd >/dev/null; then
-        log "正在同步时间 (ntpd -q)..."
-        ntpd -q -p "$ntp_server" 2>&1 | logger -t AdBlock
+        # 从 UCI 获取 NTP 服务器列表
+        local ntp_servers=$(uci get system.ntp.server 2>/dev/null)
+        if [ -z "$ntp_servers" ]; then
+            log "未从 UCI 获取到 NTP 服务器，使用默认 ntp.aliyun.com"
+            ntp_servers="ntp.aliyun.com"
+        fi
+        # 构造参数
+        local ntp_args=""
+        for s in $ntp_servers; do
+            ntp_args="$ntp_args -p $s"
+        done
+        log "正在同步时间 (ntpd -n -q$ntp_args)..."
+        ntpd -n -q $ntp_args 2>&1 | logger -t AdBlock
     else
         log "警告：未找到时间同步工具，跳过时间同步"
         return 1
