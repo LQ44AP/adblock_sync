@@ -275,7 +275,7 @@ update_list() {
 }
 
 start() {
-    update_list
+    (sleep 20; update_list) &
 }
 
 reload() {
